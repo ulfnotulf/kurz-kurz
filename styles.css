@@ -249,6 +249,16 @@ body.weather-gradient::before {
 
 .day-msg {}
 
+/* Weather screen with an interactive rider: the whole screen is the drag
+   surface — no text selection or iOS long-press callout, and horizontal
+   touch moves belong to the rider (vertical ones stay with the browser) */
+body:has(.cyclist[data-hop]) {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: pan-y;
+}
+
 /* Cyclist animation — 120px above the bottom edge of the viewport */
 .cyclist,
 .cyclist-pass {

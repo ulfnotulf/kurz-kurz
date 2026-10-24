@@ -384,6 +384,7 @@ async function playCyclistIntro(img, tier, convoy = true) {
     img.style.transform = ON_STAGE;
     return;
   }
+  enableRiderGestures(img);
 
   const riders = !convoy ? [] : CYCLIST_TIERS.map(() => {
     const r = document.createElement('div');
@@ -410,21 +411,33 @@ async function playCyclistIntro(img, tier, convoy = true) {
   });
 
   // Matching rider: 4th in line, same speed, then brakes into the centre.
-  // Ease-out-cubic starts at 3× its average speed → duration chosen so the
-  // entry velocity equals the convoy speed (no visible jolt).
-  const brakeDist = -offLeft * ARRIVE_EASE_SHARE;
-  const cruiseMs = (-offLeft - brakeDist) / speed;
+  arriveCyclist(img, { delay: riders.length * spacingMs });
+}
+
+/* Ride into the centre from off-screen at constant speed, then brake.
+   side −1: from the left (faster than the camera), +1: from the right
+   (slower than the camera). passMs sets the speed like PASS_MS.
+   Ease-out-cubic starts at 3× its average speed → duration chosen so the
+   entry velocity equals the cruising speed (no visible jolt). */
+function arriveCyclist(img, { side = -1, passMs = PASS_MS, delay = 0 } = {}) {
+  const vw = window.innerWidth;
+  const w = img.getBoundingClientRect().width;
+  const off = (vw + w) / 2;
+  const speed = (vw + w) / passMs;
+  const brakeDist = off * ARRIVE_EASE_SHARE;
+  const cruiseMs = (off - brakeDist) / speed;
   const brakeMs = 3 * brakeDist / speed;
   img.style.transform = ON_STAGE;
   const arrive = img.animate(
     [
-      { transform: tx(offLeft), easing: 'linear' },
-      { transform: tx(-brakeDist), easing: EASE_OUT_CUBIC, offset: cruiseMs / (cruiseMs + brakeMs) },
+      { transform: tx(side * off), easing: 'linear' },
+      { transform: tx(side * brakeDist), easing: EASE_OUT_CUBIC, offset: cruiseMs / (cruiseMs + brakeMs) },
       { transform: ON_STAGE },
     ],
-    { duration: cruiseMs + brakeMs, delay: riders.length * spacingMs, fill: 'backwards' }
+    { duration: cruiseMs + brakeMs, delay, fill: 'backwards' }
   );
   arrive.finished.then(() => startIdleSway(img), () => {});
+  return arrive;
 }
 
 /* ==========================================================================
@@ -446,7 +459,26 @@ async function mountCyclist(host, tier) {
     markup = `<img src="${cyclistSrc(tier)}" alt="">`;
   }
   const root = host.shadowRoot || host.attachShadow({ mode: 'open' });
-  root.innerHTML = `<style>:host{display:block}svg,img{display:block;width:100%;height:100%}</style>${markup}`;
+  root.innerHTML = `<style>:host{display:block;-webkit-tap-highlight-color:transparent}svg,img{display:block;width:100%;height:100%}` +
+    `:host([data-hop]) svg>g{pointer-events:visible;cursor:pointer;touch-action:pan-y}</style>${markup}`;
+  const svg = root.querySelector('svg');
+  if (svg) padStage(svg);
+}
+
+/* Headroom around the drawing for the bunnyhop (SVG units): the tilted rear
+   wheel reaches x ≈ −50, the head y ≈ −140. Safari clips the outer <svg> at
+   its box despite overflow:visible, so the SVG gets a larger viewBox and an
+   equally larger, offset box — the figure keeps its size and position. */
+const STAGE = { w: 1720, h: 1137, boxH: 1268, padX: 80, padTop: 180, padBottom: 40 };
+function padStage(svg) {
+  const { w, h, boxH, padX, padTop, padBottom } = STAGE;
+  const vw = w + 2 * padX, vh = h + padTop + padBottom;
+  svg.setAttribute('viewBox', `${-padX} ${-padTop} ${vw} ${vh}`);
+  Object.assign(svg.style, {
+    position: 'absolute',
+    left: `${(-padX / w) * 100}%`, top: `${(-padTop / boxH) * 100}%`,  /* drawing sits at the top of the host box */
+    width: `${(vw / w) * 100}%`, height: `${(vh / boxH) * 100}%`,
+  });
 }
 
 /* ==========================================================================
@@ -485,7 +517,8 @@ function pedalTick(now) {
     if (!host.isConnected) { pedalling.delete(host); continue; }
     const x = new DOMMatrixReadOnly(getComputedStyle(host).transform).m41;
     const dt = s.t === null ? 0 : now - s.t;
-    if (dt > 0) {
+    if (s.hop) { /* the bunnyhop drives the crank */ }
+    else if (dt > 0) {
       const v = (x - s.x) / dt;                                         /* px per ms, relative to the camera */
       const vRef = (window.innerWidth + host.offsetWidth) / PASS_MS;    /* convoy speed */
       const swaying = host.dataset.sway && !host.dataset.leaving;
@@ -501,12 +534,370 @@ function pedalTick(now) {
   pedalFrame = pedalling.size ? requestAnimationFrame(pedalTick) : 0;
 }
 
+/* ==========================================================================
+   Bunnyhop — click / tap on the rider. Built on anticipation (Disney):
+     1. Schwung holen  the pedals coast to horizontal, then hip and upper body
+                       sink (≈10 % of the figure height), knees and elbows bend
+     2. Absprung       knees and elbows extend upwards, the front wheel lifts
+     3. Flug           hands and feet pull the bike up (≈20 % of the figure height)
+     4. Landung        the body absorbs the impact — the crouch reversed:
+                       fast down, slow back up
+   Feet (pedals) and hands (bar) are the contact points: they move with the
+   bike, knees and elbows follow by two-bone IK. During the hop the pedalling
+   CSS animations stay paused at the level-pedal phase; script animations on
+   the same elements override them and are dropped afterwards.
+   Rig values are SVG user units (viewBox 1720 × 1137, y down), measured at
+   crank phase 212.5 ms (pedals level, body and bike at their lowest bob).
+   ========================================================================== */
+const HOP_FIGURE_H = 1100;                /* cap top → tyre bottom */
+const HOP_CROUCH   = 0.10 * HOP_FIGURE_H; /* phase 1: sink of the hip */
+const HOP_LIFT     = 0.20 * HOP_FIGURE_H; /* phase 3: height of the bike */
+const HOP_MS       = 1300;                /* crouch → back to riding, after the coast */
+const HOP_COAST_MAX_MS    = 450;          /* longest pedal run-out before the crouch */
+const HOP_COAST_MIN_PHASE = 60;           /* skip a level position closer than this (crank ms) */
+const HOP_LEVEL_PHASES    = [212.5, 637.5]; /* crank phases with level pedals; far foot in front at the first */
+
+/* Tracks: [time ms, value, easing of the segment that starts here].
+   body*: hip translation and torso rotation about the hip (deg, − = shoulders up)
+   bike*: bike translation and pitch about the rear contact (deg, − = front up) */
+const HOP_TRACKS = {
+  bodyX:   [[0, 0, 'inOut'], [320, -30, 'out'], [440, 10, 'inOut'], [600, 0, 'out'], [900, -15, 'inOut'], [HOP_MS, 0]],
+  bodyY:   [[0, 0, 'inOut'], [320, HOP_CROUCH, 'out'], [440, -105, 'out'], [600, -160, 'in'],
+            [790, -30, 'out'], [900, 0.9 * HOP_CROUCH, 'inOut'], [HOP_MS, 0]],
+  bodyRot: [[0, 0, 'inOut'], [320, -3, 'out'], [440, -7, 'inOut'], [600, -2, 'inOut'], [790, 0, 'out'],
+            [900, 2, 'inOut'], [HOP_MS, 0]],
+  bikeY:   [[0, 0, 'lin'], [440, 0, 'out'], [620, -HOP_LIFT, 'in'], [800, 0]],
+  bikeRot: [[0, 0, 'lin'], [320, 0, 'out'], [440, -8, 'inOut'], [620, -1, 'inOut'], [800, 0]],
+};
+const HOP_EASE = {
+  lin:   u => u,
+  in:    u => u * u,
+  out:   u => 1 - (1 - u) * (1 - u),
+  inOut: u => (u < 0.5 ? 2 * u * u : 1 - 2 * (1 - u) * (1 - u)),
+};
+const HOP_RIG = {
+  hip:         { x: 789,   y: 336 },
+  shoulder:    { x: 1293,  y: 266 },
+  hand:        { x: 1315,  y: 604 },
+  pedalFront:  { x: 873.3, y: 834.6 },
+  pedalRear:   { x: 704.2, y: 834.6 },
+  rearContact: { x: 356,   y: 1147 },
+  bodyBase: [735, 149],                         /* #upper-body translate */
+  bikeBase: [0, 435],                           /* #r__der translate */
+  legOrigin: { x: 789, y: 316 }, legPivot: 315.429, thigh: 302, shank: 302,
+  shoulderLocal: { x: 558, y: 117 },            /* in #upper-body */
+  upperArmBase: [392, -49], upperArmPivot: 166, upperArm: 234.76,
+  forearmPivot: 188, forearm: 265.87,
+};
+
+function hopTrack(keys, t) {
+  if (t <= keys[0][0]) return keys[0][1];
+  for (let i = 1; i < keys.length; i++) {
+    if (t <= keys[i][0]) {
+      const [t0, v0, ease] = keys[i - 1];
+      return v0 + (keys[i][1] - v0) * HOP_EASE[ease]((t - t0) / (keys[i][0] - t0));
+    }
+  }
+  return keys[keys.length - 1][1];
+}
+
+/* Joint of a two-bone chain from root a towards target b; side picks the bend */
+function hopIK(a, b, l1, l2, side) {
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+  const d = Math.min(l1 + l2 - 0.5, Math.max(Math.abs(l1 - l2) + 0.5, len));
+  const ex = dx / len, ey = dy / len;
+  const along = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, l1 * l1 - along * along));
+  return { x: a.x + ex * along - side * ey * h, y: a.y + ey * along + side * ex * h };
+}
+
+/* CSS rotation (deg) that turns direction (ux, uy) into the direction from p to q */
+const hopAngle = (ux, uy, p, q) => {
+  const vx = q.x - p.x, vy = q.y - p.y;
+  return Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy) * 180 / Math.PI;
+};
+const aboutPoint = (m, p, deg) => m.translate(p.x, p.y).rotate(deg).translate(-p.x, -p.y);
+const hopMatrix = m => `matrix(${m.a},${m.b},${m.c},${m.d},${m.e},${m.f})`;
+
+/* Transforms of all hop-driven elements at time t (ms after the coast) */
+function hopPose(t, farLegInFront) {
+  const R = HOP_RIG;
+  const tr = key => hopTrack(HOP_TRACKS[key], t);
+
+  const bodyK = aboutPoint(new DOMMatrix().translate(tr('bodyX'), tr('bodyY')), R.hip, tr('bodyRot'));
+  const body = bodyK.translate(...R.bodyBase);
+  const hip = bodyK.transformPoint(R.hip);
+
+  const bikeK = aboutPoint(new DOMMatrix().translate(0, tr('bikeY')), R.rearContact, tr('bikeRot'));
+  const bike = bikeK.translate(...R.bikeBase);
+
+  /* arm, in #upper-body coordinates */
+  const hand = body.inverse().transformPoint(bikeK.transformPoint(R.hand));
+  const sh = R.shoulderLocal;
+  const elbow = hopIK(sh, hand, R.upperArm, R.forearm, 1);
+  const ua = R.upperArmPivot, fa = R.forearmPivot;
+  const upperArm = aboutPoint(new DOMMatrix().translate(...R.upperArmBase), { x: ua, y: ua }, hopAngle(-1, 1, sh, elbow));
+  const forearm = aboutPoint(new DOMMatrix().translate(hand.x - fa, hand.y - fa), { x: fa, y: fa }, hopAngle(-1, -1, hand, elbow));
+
+  /* legs, in SVG coordinates (the leg groups are only translated) */
+  const lp = { x: R.legPivot, y: R.legPivot };
+  const leg = pedal => {
+    const foot = bikeK.transformPoint(pedal);
+    const knee = hopIK(hip, foot, R.thigh, R.shank, -1);
+    const a = hopAngle(0, 1, hip, knee);
+    return [
+      aboutPoint(new DOMMatrix().translate(hip.x - R.legOrigin.x, hip.y - R.legOrigin.y), lp, a),
+      aboutPoint(new DOMMatrix().translate(0, R.thigh), lp, hopAngle(0, 1, knee, foot) - a),
+    ];
+  };
+  const [thighFar, shankFar]   = leg(farLegInFront ? R.pedalFront : R.pedalRear);
+  const [thighNear, shankNear] = leg(farLegInFront ? R.pedalRear : R.pedalFront);
+
+  return { body, bike, upperArm, forearm, thighFar, shankFar, thighNear, shankNear };
+}
+
+const HOP_ELEMENTS = {
+  body: 'upper-body', bike: 'r__der', upperArm: 'ober-arm', forearm: 'unter-arm',
+  thighFar: 'thigh-pivot-leg-far', shankFar: 'shank-pivot-leg-far',
+  thighNear: 'thigh-pivot-leg-far_2', shankNear: 'shank-pivot-leg-far_2',
+};
+
+/* ==========================================================================
+   Rider gestures — tap: bunnyhop; drag right: rides out to the right and
+   comes back from the left; drag left: falls back out to the left (slower)
+   and comes back from the right — only when released fast enough (FLING_V),
+   otherwise the rider rolls back to the centre. While dragged the rider
+   follows the pointer. Cadence needs no extra code: pedalTick derives it from the
+   on-screen speed (right = faster than the camera, left = slower).
+   ========================================================================== */
+const DRAG_SLOP      = 8;     /* px before a press becomes a drag */
+const FLING_V        = 1.5;   /* px/ms release speed needed to leave — slower drags snap back */
+const FLING_MIN_DX   = 24;    /* px the drag must have covered in the fling direction */
+const FLING_WINDOW   = 100;   /* ms before release over which the speed is measured */
+const FLING_REST     = 80;    /* ms without movement before release → speed 0 */
+const FALL_BACK_MS   = 900;   /* leaving to the left: slower than LEAVE_MS */
+const FALL_BACK_PASS_MS = 1600; /* coming back from the right: slower than PASS_MS */
+const LAP_PAUSE_MS   = 350;   /* time off-screen before coming back */
+const RETURN_OMEGA   = 0.002; /* 1/ms — slow release: spring back to the centre, settles in ≈ 3 s */
+const EXIT_MIN_MS    = 250;   /* fast release: the ride-out to the right lasts at least this long
+                                 (left: scaled by FALL_BACK_MS / LEAVE_MS) — caps the carried speed */
+
+/* Presses that belong to the page, not to the rider */
+const GESTURE_EXCLUDE = 'a, button, input, textarea, select, label, [data-action], [role="link"], [role="button"]';
+
+/* Drag works anywhere on the weather screen (except links and controls) —
+   the rider follows the pointer relative to where it went down. A tap only
+   hops when it lands on the rider (its bounding box, so the gaps between
+   legs, frame and wheels count too). The listener sits on the document and
+   removes itself once this rider is gone. */
+function enableRiderGestures(host) {
+  host.dataset.hop = '';
+  const figure = host.shadowRoot && host.shadowRoot.querySelector('svg > g');
+  const onFigure = e => {
+    const r = (figure || host).getBoundingClientRect();
+    return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+  };
+  const listen = new AbortController();
+  document.addEventListener('pointerdown', e => {
+    if (!host.isConnected) { listen.abort(); return; }
+    if (!e.isPrimary || e.button > 0) return;
+    if (e.composedPath().some(el => el instanceof Element && el.matches(GESTURE_EXCLUDE))) return;
+    if (host.dataset.leaving || pedalling.get(host)?.hop) return;
+    if (host.dataset.moving && !host.dataset.returning) return;  /* ride-out / re-entry runs */
+    e.preventDefault();
+    const tap = onFigure(e);
+    const id = e.pointerId, x0 = e.clientX;
+    let base = null;               /* translateX at drag start, minus the slop */
+    const samples = [{ x: x0, t: e.timeStamp }];
+
+    const move = ev => {
+      if (ev.pointerId !== id) return;
+      const dx = ev.clientX - x0;
+      if (base === null) {
+        if (Math.abs(dx) < DRAG_SLOP) return;
+        host.dataset.moving = '1';
+        base = holdCyclist(host) - dx;  /* grabs it where it is, also mid-return; no jump */
+      }
+      samples.push({ x: ev.clientX, t: ev.timeStamp });
+      while (samples.length > 2 && ev.timeStamp - samples[1].t > FLING_WINDOW) samples.shift();
+      host.style.transform = tx(base + dx);
+    };
+    const end = ev => {
+      if (ev.pointerId !== id) return;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+      if (base === null) { if (ev.type === 'pointerup' && tap) startHop(host); return; }
+      if (host.dataset.leaving) return;
+      const vx = releaseSpeed(samples, ev.timeStamp);
+      const dx = ev.clientX - x0;
+      const side = ev.type === 'pointercancel' || Math.abs(vx) < FLING_V
+        || Math.sign(vx) !== Math.sign(dx) || Math.abs(dx) < FLING_MIN_DX ? 0 : Math.sign(vx);
+      if (side) lapCyclist(host, side, vx); else returnCyclist(host, vx);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+  }, { signal: listen.signal });
+}
+
+/* Pointer speed (px/ms) over the last FLING_WINDOW ms; 0 if it rested */
+function releaseSpeed(samples, now) {
+  const last = samples[samples.length - 1];
+  if (now - last.t > FLING_REST) return 0;
+  let first = samples.find(p => last.t - p.t <= FLING_WINDOW);
+  if (first === last) first = samples[samples.length - 2] || last;  /* sparse events */
+  const dt = last.t - first.t;
+  return dt >= 16 ? (last.x - first.x) / dt : 0;
+}
+
+/* Stop whatever moves the rider (entry, idle sway) and keep it where it is */
+function holdCyclist(img) {
+  const x = new DOMMatrixReadOnly(getComputedStyle(img).transform).m41;
+  img.swayRun = (img.swayRun || 0) + 1;  /* ends a running idle sway */
+  delete img.dataset.sway;
+  delete img.dataset.returning;
+  img.getAnimations().forEach(a => a.cancel());
+  img.style.transform = tx(x);
+  return x;
+}
+
+/* side +1: out to the right, back from the left; −1: fall back out to the
+   left, back from the right. v0 = release speed (px/ms) for a smooth start. */
+async function lapCyclist(img, side, v0 = 0) {
+  const vw = window.innerWidth;
+  const w = img.getBoundingClientRect().width;
+  const from = new DOMMatrixReadOnly(getComputedStyle(img).transform).m41;
+  const to = side * (vw + w) / 2;
+  /* Keeps the release speed and accelerates from there at a constant rate:
+     x(t) = v·t + a·t²/2. a is the rate that takes a resting rider from the
+     centre off-screen in LEAVE_MS (right) or FALL_BACK_MS (left); the
+     duration follows from speed and distance. As easing: quadratic
+     p(u) = k·u + (1 − k)·u² with k = v·t / d, written as a cubic Bézier. */
+  const ref = side > 0 ? LEAVE_MS : FALL_BACK_MS;
+  const a = (vw + w) / (ref * ref);              /* = 2 · ((vw + w) / 2) / ref² */
+  const d = Math.abs(to - from);
+  /* speed cap: the exit must stay visible for at least minMs, whatever the
+     fling — d = v·t + a·t²/2 solved for v at t = minMs. Depends on viewport
+     width and distance left, so phone and desktop feel alike. */
+  const minMs = EXIT_MIN_MS * ref / LEAVE_MS;
+  const vMax = Math.max(0, (d - a * minMs * minMs / 2) / minMs);
+  const v = Math.min(vMax, Math.max(0, v0 * side));  /* release speed towards the exit */
+  const duration = (Math.sqrt(v * v + 2 * a * d) - v) / a;
+  const k = d ? v * duration / d : 0;            /* start speed / average speed, < 1 */
+  img.style.transform = tx(to);
+  const out = img.animate(
+    [{ transform: tx(from) }, { transform: tx(to) }],
+    { duration, easing: `cubic-bezier(${1 / 3}, ${(k / 3).toFixed(4)}, ${2 / 3}, ${((k + 1) / 3).toFixed(4)})` }
+  );
+  out.startTime = document.timeline.currentTime;  /* run from this frame — no one-frame hold after release */
+  try { await out.finished; } catch { return; }  /* cancelled, e.g. by rideCyclistOut */
+  if (!img.isConnected || img.dataset.leaving) return;
+  arriveCyclist(img, { side: -side, passMs: side > 0 ? PASS_MS : FALL_BACK_PASS_MS, delay: LAP_PAUSE_MS });
+}
+
+/* Slow release: the rider keeps its momentum and is pulled back to the
+   centre by a critically damped spring — released moving outwards it
+   overshoots, slows down, turns and settles; released moving inwards it
+   glides in (it may pass the centre once) without bouncing.
+     x(t) = (x0 + (v0 + ω·x0)·t) · e^(−ω·t)
+   Sampled into keyframes, so it runs as one Web Animation. Cadence follows
+   from the on-screen speed in pedalTick: moving right = faster than the
+   camera (more rpm), left = slower. v0 = release speed (px/ms). */
+function returnCyclist(img, v0 = 0) {
+  const x0 = new DOMMatrixReadOnly(getComputedStyle(img).transform).m41;
+  const w = RETURN_OMEGA;
+  const x = t => (x0 + (v0 + w * x0) * t) * Math.exp(-w * t);
+  const v = t => (v0 - w * (v0 + w * x0) * t) * Math.exp(-w * t);
+  const step = 1000 / 60;
+  let duration = step;
+  while (duration < 4000 && (Math.abs(x(duration)) > 0.3 || Math.abs(v(duration)) > 0.01)) duration += step;
+  const frames = [];
+  for (let t = 0; t < duration; t += step) frames.push({ transform: tx(x(t)), offset: t / duration });
+  frames.push({ transform: ON_STAGE, offset: 1 });
+  img.style.transform = ON_STAGE;
+  img.dataset.returning = '1';  /* may be grabbed again on the way back */
+  const back = img.animate(frames, { duration, easing: 'linear' });
+  back.startTime = document.timeline.currentTime;  /* run from this frame — no hold after release */
+  back.finished.then(() => startIdleSway(img), () => {});
+}
+
+function startHop(host) {
+  const s = pedalling.get(host);
+  const root = host.shadowRoot;
+  if (!s || s.hop || host.dataset.leaving || prefersReducedMotion()) return;
+  if (host.dataset.moving && !host.dataset.returning) return;  /* hopping while drifting back is fine */
+  const svg = root.querySelector('svg');
+  const els = Object.fromEntries(Object.entries(HOP_ELEMENTS).map(([k, id]) => [k, root.getElementById(id)]));
+  if (!svg || Object.values(els).some(el => !el)) return;  /* <img> fallback */
+
+  /* 1a. coast to the next level-pedal phase: Hermite curve from the current
+     crank speed down to zero */
+  const v0 = Math.max(s.rpm, CADENCE_BASE_RPM / 2) / 60000 * CRANK_CYCLE_MS;  /* crank ms per ms */
+  let target = 0, delta = Infinity;
+  for (const level of HOP_LEVEL_PHASES) {
+    let d = (level - s.phase + CRANK_CYCLE_MS) % CRANK_CYCLE_MS;
+    if (d < HOP_COAST_MIN_PHASE) d += CRANK_CYCLE_MS;
+    if (d < delta) { delta = d; target = level; }
+  }
+  const coastMs = Math.min(HOP_COAST_MAX_MS, 2 * delta / v0);  /* ≤ 3·delta/v0 keeps it monotonic */
+  const from = s.phase;
+  const farLegInFront = target === HOP_LEVEL_PHASES[0];
+  const t0 = performance.now();
+  let overrides = null;
+  s.hop = true;
+
+  const finish = () => {
+    if (overrides) Object.values(overrides).forEach(a => a.cancel());
+    svg.unpauseAnimations();
+    s.rpm = 0;      /* pedalling picks up again from standstill */
+    s.hop = false;
+  };
+
+  const frame = now => {
+    if (!host.isConnected) { s.hop = false; return; }
+    if (host.dataset.leaving) { finish(); return; }
+    const elapsed = now - t0;
+    if (elapsed < coastMs) {
+      const u = elapsed / coastMs;
+      const p = (u ** 3 - 2 * u ** 2 + u) * coastMs * v0 + (3 * u ** 2 - 2 * u ** 3) * delta;
+      s.phase = (from + p) % CRANK_CYCLE_MS;
+      s.anims.forEach(a => { a.currentTime = s.phase; });
+      requestAnimationFrame(frame);
+      return;
+    }
+    const t = elapsed - coastMs;
+    if (t >= HOP_MS) { finish(); return; }
+    const pose = hopPose(t, farLegInFront);
+    if (!overrides) {
+      s.phase = target;
+      s.anims.forEach(a => { a.currentTime = target; });
+      svg.pauseAnimations();  /* wheel squash (SMIL) */
+      overrides = Object.fromEntries(Object.entries(els).map(([k, el]) => {
+        const a = el.animate([{ transform: 'none' }, { transform: 'none' }], { duration: 1, fill: 'both' });
+        a.pause();
+        return [k, a];
+      }));
+    }
+    for (const k in overrides) {
+      const m = hopMatrix(pose[k]);
+      overrides[k].effect.setKeyframes([{ transform: m }, { transform: m }]);
+    }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
 /* Slow back-and-forth around the centre once the rider has arrived.
    Every swing turns at a random distance (IDLE_SWAY_MIN…MAX) on the other
    side, with zero speed at each turning point — no jolt after the braking. */
 async function startIdleSway(img) {
-  const stopped = () => !IDLE_SWAY || !img.isConnected || img.dataset.leaving;
+  const run = img.swayRun = (img.swayRun || 0) + 1;  /* holdCyclist ends this run */
+  const stopped = () => !IDLE_SWAY || !img.isConnected || img.dataset.leaving || img.swayRun !== run;
   const randomAmp = () => IDLE_SWAY_MIN + Math.random() * (IDLE_SWAY_MAX - IDLE_SWAY_MIN);
+  delete img.dataset.moving;  /* back in place: gestures allowed again */
+  delete img.dataset.returning;
+  if (stopped()) return;
   img.dataset.sway = '1';  /* pedalling ignores this movement */
 
   let from = ON_STAGE;
