@@ -462,14 +462,32 @@ async function mountCyclist(host, tier) {
   root.innerHTML = `<style>:host{display:block;-webkit-tap-highlight-color:transparent}svg,img{display:block;width:100%;height:100%}` +
     `:host([data-hop]) svg>g{pointer-events:visible;cursor:pointer;touch-action:pan-y}</style>${markup}`;
   const svg = root.querySelector('svg');
-  if (svg) padStage(svg);
+  if (svg) { padStage(svg); wrapForWheelie(root); }
 }
 
-/* Headroom around the drawing for the bunnyhop (SVG units): the tilted rear
-   wheel reaches x ≈ −50, the head y ≈ −140. Safari clips the outer <svg> at
+/* Wheelie wrappers: empty <g> around the parts the wheelie moves, so its
+   transforms stack on top of the pedalling CSS animations instead of
+   replacing them. Runs before registerPedalling (moving an element later
+   would restart its CSS animation). */
+const WHEELIE_PARTS = ['r__der', 'upper-body', 'ober-arm', 'unter-arm', 'kopf-container', 'HIP',
+  'thigh-pivot-leg-far', 'thigh-pivot-leg-far_2'];
+function wrapForWheelie(root) {
+  for (const id of WHEELIE_PARTS) {
+    const el = root.getElementById(id);
+    if (!el) continue;
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('data-wheelie', id);
+    el.before(g);
+    g.append(el);
+  }
+}
+
+/* Headroom around the drawing for bunnyhop and wheelie (SVG units): in the
+   wheelie (≈32° about the rear contact) the rear wheel reaches x ≈ −190,
+   the cap y ≈ −400. Safari clips the outer <svg> at
    its box despite overflow:visible, so the SVG gets a larger viewBox and an
    equally larger, offset box — the figure keeps its size and position. */
-const STAGE = { w: 1720, h: 1137, boxH: 1268, padX: 80, padTop: 180, padBottom: 40 };
+const STAGE = { w: 1720, h: 1137, boxH: 1268, padX: 220, padTop: 440, padBottom: 40 };
 function padStage(svg) {
   const { w, h, boxH, padX, padTop, padBottom } = STAGE;
   const vw = w + 2 * padX, vh = h + padTop + padBottom;
@@ -522,7 +540,7 @@ function pedalTick(now) {
       const v = (x - s.x) / dt;                                         /* px per ms, relative to the camera */
       const vRef = (window.innerWidth + host.offsetWidth) / PASS_MS;    /* convoy speed */
       const swaying = host.dataset.sway && !host.dataset.leaving;
-      const target = swaying ? CADENCE_BASE_RPM : Math.min(CADENCE_MAX_RPM, Math.max(0,
+      const target = s.cadence != null ? s.cadence : swaying ? CADENCE_BASE_RPM : Math.min(CADENCE_MAX_RPM, Math.max(0,
         CADENCE_BASE_RPM + (v / vRef) * (CADENCE_CONVOY_RPM - CADENCE_BASE_RPM)));
       s.rpm += (target - s.rpm) * (1 - Math.exp(-dt / CADENCE_SMOOTH_MS));
       s.phase = (s.phase + dt * s.rpm / 60000 * CRANK_CYCLE_MS) % CRANK_CYCLE_MS;
@@ -663,7 +681,8 @@ const HOP_ELEMENTS = {
 };
 
 /* ==========================================================================
-   Rider gestures — tap: bunnyhop; drag right: rides out to the right and
+   Rider gestures — tap on the front wheel: wheelie; tap elsewhere on the
+   rider: bunnyhop; drag right: rides out to the right and
    comes back from the left; drag left: falls back out to the left (slower)
    and comes back from the right — only when released fast enough (FLING_V),
    otherwise the rider rolls back to the centre. While dragged the rider
@@ -697,15 +716,24 @@ function enableRiderGestures(host) {
     const r = (figure || host).getBoundingClientRect();
     return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
   };
+  const onFrontWheel = e => {
+    const wheel = host.shadowRoot && host.shadowRoot.getElementById('VORDERRAD');
+    if (!wheel) return false;
+    const r = wheel.getBoundingClientRect();
+    const radius = Math.max(22, r.width / 2 + WHEELIE.hitSlopPx);  /* ≥ 44 px target */
+    return Math.hypot(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2)) <= radius;
+  };
   const listen = new AbortController();
   document.addEventListener('pointerdown', e => {
     if (!host.isConnected) { listen.abort(); return; }
     if (!e.isPrimary || e.button > 0) return;
     if (e.composedPath().some(el => el instanceof Element && el.matches(GESTURE_EXCLUDE))) return;
-    if (host.dataset.leaving || pedalling.get(host)?.hop) return;
+    const ps = pedalling.get(host);
+    if (host.dataset.leaving || ps?.hop || ps?.wheelie) return;
     if (host.dataset.moving && !host.dataset.returning) return;  /* ride-out / re-entry runs */
     e.preventDefault();
-    const tap = onFigure(e);
+    const wheelTap = onFrontWheel(e);
+    const tap = wheelTap || onFigure(e);
     const id = e.pointerId, x0 = e.clientX;
     let base = null;               /* translateX at drag start, minus the slop */
     const samples = [{ x: x0, t: e.timeStamp }];
@@ -727,7 +755,7 @@ function enableRiderGestures(host) {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', end);
       window.removeEventListener('pointercancel', end);
-      if (base === null) { if (ev.type === 'pointerup' && tap) startHop(host); return; }
+      if (base === null) { if (ev.type === 'pointerup' && tap) (wheelTap ? startWheelie : startHop)(host); return; }
       if (host.dataset.leaving) return;
       const vx = releaseSpeed(samples, ev.timeStamp);
       const dx = ev.clientX - x0;
@@ -825,7 +853,7 @@ function returnCyclist(img, v0 = 0) {
 function startHop(host) {
   const s = pedalling.get(host);
   const root = host.shadowRoot;
-  if (!s || s.hop || host.dataset.leaving || prefersReducedMotion()) return;
+  if (!s || s.hop || s.wheelie || host.dataset.leaving || prefersReducedMotion()) return;
   if (host.dataset.moving && !host.dataset.returning) return;  /* hopping while drifting back is fine */
   const svg = root.querySelector('svg');
   const els = Object.fromEntries(Object.entries(HOP_ELEMENTS).map(([k, id]) => [k, root.getElementById(id)]));
@@ -883,6 +911,210 @@ function startHop(host) {
       const m = hopMatrix(pose[k]);
       overrides[k].effect.setKeyframes([{ transform: m }, { transform: m }]);
     }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+/* ==========================================================================
+   Wheelie — click / tap on the front wheel. Built on anticipation (Disney):
+     1. Schwung holen  upper body sinks forward, elbows bend
+     2. Aufrichten     weight back + one hard pedal stroke: the front wheel
+                       comes up, the figure turns ≈30° about the rear contact,
+                       the head turns back against it (gaze stays forward)
+     3. Wheelie        balancing on the rear wheel: each pass swings to a
+                       random angle in a random time; the upper body slides
+                       along the torso/hip edge to counter it
+     4. Landung        balance is given up: the figure tips forward, slowly
+                       at first, then faster; the body absorbs the impact —
+                       phase 1 reversed, softer: fast down, slow back up
+   Seated: the standard animation is a standing pedal stroke (body, hip,
+   thighs and bike bob up and down, the wheels squash to suggest the bike
+   leaning sideways). During the wheelie bob and squash are faded
+   out and pedalling shows as a slight forward/back rocking of the upper
+   body about the seat point instead. Hip and thighs stay together; the
+   upper body only rotates about the seat point and slides along its lower
+   back edge, so the gap to the hip stays constant. Hands stay on the bar
+   (two-bone IK). All transforms go on wrapper groups (wrapForWheelie) and
+   the figure group; the pedalling CSS animations keep running underneath.
+   The idle sway (camera) is the host's transform and simply overlays this.
+   Angles in degrees, SVG sense (+ = clockwise: upper body forward / − =
+   front wheel up). Lengths in SVG units (viewBox 1720 × 1137).
+   ========================================================================== */
+const WHEELIE = {
+  angle:          -32,   /* figure pitch in phase 3 */
+  headDeg:         32,   /* head turned back against the pitch, at full angle */
+  headOut:         18,   /* head moved away from the body along the torso axis, at full angle */
+  anticipateMs:   350,   /* phase 1 */
+  liftMs:         450,   /* phase 2 */
+  holdMs:        3000,   /* phase 3 — ends at the next turning point after this */
+  dropMs:         650,   /* phase 4a: balance given up, the figure tips back down */
+  dropPower:      2.5,   /* … easing u^dropPower: starts almost at rest, accelerates gradually */
+  absorbMs:       450,   /* phase 4b: body springs in and back out */
+  absorbDownShare: 0.3,  /* share of absorbMs going down (fast), rest back up (slow) */
+  crouchDeg:       12,   /* phase 1: upper body forward about the seat point */
+  crouchShift:     20,   /* … and down/forward along the torso/hip edge */
+  landDeg:          7,   /* phase 4b: same, softer */
+  landShift:       12,
+  pullDeg:         -5,   /* phase 2: upper body thrown back */
+  shiftBack:      -42,   /* phase 2/3: upper body slides back/up along the torso/hip edge */
+  overshoot:     -1.5,   /* phase 2 ends this far beyond angle, then settles into the wobble */
+  kickRpm:        120,   /* phase 2: pedal stroke */
+  kickShare:      0.6,   /* share of phase 2 at kickRpm */
+  wobbleDeg:        1,   /* phase 3: max deviation from angle per pass */
+  wobbleMinShare: 0.4,   /* deviation random between wobbleMinShare·wobbleDeg and wobbleDeg */
+  wobbleMs:       500,   /* duration of one pass (swing to the other side) */
+  wobbleJitter:   0.3,   /* pass duration random within ± this share of wobbleMs */
+  balanceShift:    15,   /* phase 3: slide per degree of deviation (forward when too high) */
+  rockDeg:        1.5,   /* seated pedalling: upper body rocks ± this, one rock per pedal stroke */
+  hitSlopPx:        8,   /* tap target: front wheel circle + this */
+};
+const WHEELIE_RIG = {
+  rearContact: { x: 356, y: 1137 },  /* figure coordinates */
+  bodyBase: { x: 735, y: 129 },      /* #upper-body translate without bob */
+  wheelsY: 425,                      /* #r__der translate without bob */
+  wheelTop: 16, wheelSize: 680,      /* wheel rect y and unsquashed height */
+  bobMax: 20,                        /* body bob of the standing stroke */
+  seat:     { x: 60,  y: 58 },       /* below in #upper-body coordinates: pivot on the lower back edge */
+  edge:     { x: 0.7202, y: 0.6938 },/* direction of that edge (back tip → belly), + = down/forward */
+  shoulder: { x: 558, y: 117 },
+  wrist:    { x: 580, y: 472 },
+  head:     { x: 710, y: 16 },       /* centre of the head circle */
+  axis:     { x: 0.9905, y: -0.1376 }, /* torso axis, hip → shoulder */
+  upperArm: 234.76, forearm: 265.87,
+  upperArmBase: [392, -49], forearmBase: [392, 284], forearmPivot: 188,
+  legPivot: 315.429,
+};
+const WHEELIE_THIGHS = ['thigh-pivot-leg-far', 'thigh-pivot-leg-far_2'];
+const lerp = (a, b, u) => a + (b - a) * u;
+const easeSine = u => (1 - Math.cos(Math.PI * u)) / 2;
+const angleTo = (p, q) => Math.atan2(q.y - p.y, q.x - p.x) * 180 / Math.PI;
+
+function startWheelie(host) {
+  const s = pedalling.get(host);
+  const root = host.shadowRoot;
+  if (!s || s.hop || s.wheelie || host.dataset.leaving || prefersReducedMotion()) return;
+  if (host.dataset.moving && !host.dataset.returning) return;
+  const figure = root && root.querySelector('svg > g');
+  const wrap = Object.fromEntries(WHEELIE_PARTS.map(id => [id, root && root.querySelector(`[data-wheelie="${id}"]`)]));
+  if (!figure || Object.values(wrap).some(el => !el)) return;  /* <img> fallback */
+
+  const W = WHEELIE, R = WHEELIE_RIG;
+  const restElbow = hopIK(R.shoulder, R.wrist, R.upperArm, R.forearm, 1);
+  const bikeWrist = { x: R.bodyBase.x + R.wrist.x, y: R.bodyBase.y + R.wrist.y };  /* figure coordinates */
+  const fp = { x: R.forearmPivot, y: R.forearmPivot };
+  const balance = tilt => W.shiftBack - W.balanceShift * (tilt - W.angle);
+  const tLift = W.anticipateMs, tHold = tLift + W.liftMs;
+  const peak = W.angle + W.overshoot;
+  let pass = { from: peak, to: peak, start: tHold, dur: 0 };
+  let side = W.overshoot < 0 ? 1 : -1;  /* first pass swings back from the overshoot */
+  let tDrop = null;
+  const t0 = performance.now();
+  s.wheelie = true;
+
+  const finish = () => {
+    figure.removeAttribute('transform');
+    Object.values(wrap).forEach(g => g.removeAttribute('transform'));
+    s.cadence = null;
+    s.wheelie = false;
+  };
+
+  /* tilt, upper body rotation and slide, cadence, seated share (0 = standing stroke, 1 = seated) */
+  const pose = t => {
+    if (t < tLift) {                                     /* 1. Schwung holen */
+      const u = HOP_EASE.inOut(t / tLift);
+      return { tilt: 0, rot: W.crouchDeg * u, shift: W.crouchShift * u, rpm: null, seat: u };
+    }
+    if (t < tHold) {                                     /* 2. Aufrichten */
+      const u = (t - tLift) / W.liftMs;
+      return {
+        tilt: peak * HOP_EASE.out(u),
+        rot: u < 0.5 ? lerp(W.crouchDeg, W.pullDeg, HOP_EASE.out(u / 0.5))
+                     : lerp(W.pullDeg, 0, HOP_EASE.inOut((u - 0.5) / 0.5)),
+        shift: lerp(W.crouchShift, balance(peak), HOP_EASE.inOut(u)),
+        rpm: u < W.kickShare ? W.kickRpm : null,
+        seat: 1,
+      };
+    }
+    while (tDrop === null && t >= pass.start + pass.dur) {  /* next pass, values random each time */
+      const end = pass.start + pass.dur;
+      if (end >= tHold + W.holdMs) { tDrop = end; break; }
+      const amp = W.wobbleDeg * lerp(W.wobbleMinShare, 1, Math.random());
+      const dur = W.wobbleMs * (1 + W.wobbleJitter * (2 * Math.random() - 1));
+      pass = { from: pass.to, to: W.angle + side * amp, start: end, dur };
+      side = -side;
+    }
+    if (tDrop === null) {                                /* 3. Wheelie */
+      const tilt = lerp(pass.from, pass.to, easeSine((t - pass.start) / pass.dur));
+      return { tilt, rot: 0, shift: balance(tilt), rpm: null, seat: 1 };
+    }
+    const td = t - tDrop;
+    if (td < W.dropMs) {                                 /* 4a. front wheel drops */
+      const u = td / W.dropMs;
+      return { tilt: pass.to * (1 - u ** W.dropPower), rot: 0,
+               shift: lerp(balance(pass.to), 0, HOP_EASE.inOut(u)), rpm: null, seat: 1 };
+    }
+    const v = (td - W.dropMs) / W.absorbMs;              /* 4b. Landung: fast in, slow out */
+    if (v >= 1) return null;
+    const k = v < W.absorbDownShare ? HOP_EASE.out(v / W.absorbDownShare)
+                                    : 1 - HOP_EASE.inOut((v - W.absorbDownShare) / (1 - W.absorbDownShare));
+    return { tilt: 0, rot: W.landDeg * k, shift: W.landShift * k, rpm: null, seat: 1 - HOP_EASE.inOut(v) };
+  };
+
+  const rearWheel = root.getElementById('HINTERRAD');
+  const animated = id => new DOMMatrix(getComputedStyle(root.getElementById(id)).transform);
+
+  const frame = now => {
+    if (!host.isConnected) { s.wheelie = false; return; }
+    const p = pose(now - t0);
+    if (!p) { finish(); return; }
+    s.cadence = p.rpm;
+    const w = p.seat;
+
+    /* bob of the standing stroke, faded out by the seated share */
+    const body = animated('upper-body');
+    const bobBody = body.f - R.bodyBase.y;
+    const bobWheels = animated('r__der').f - R.wheelsY;
+
+    /* upper body (in #upper-body coordinates): slide along the back edge,
+       rotate about the seat point, rock with the pedal strokes */
+    const rot = p.rot + W.rockDeg * (2 * bobBody / R.bobMax - 1) * w;
+    const M = aboutPoint(new DOMMatrix().translate(p.shift * R.edge.x, p.shift * R.edge.y), R.seat, rot);
+    const torso = new DOMMatrix().translate(0, -w * bobBody)
+      .translate(body.e, body.f).multiply(M).translate(-body.e, -body.f);
+    const E = torso.multiply(body);  /* #upper-body → figure, as drawn */
+
+    /* hand: from where the standing animation puts it to fixed on the bar */
+    const forearmAnim = animated('unter-arm');
+    const standHand = body.multiply(forearmAnim).transformPoint(fp);
+    const barHand = { x: bikeWrist.x, y: bikeWrist.y + (1 - w) * bobWheels };
+    const hand = E.inverse().transformPoint({ x: lerp(standHand.x, barHand.x, w), y: lerp(standHand.y, barHand.y, w) });
+    const elbow = hopIK(R.shoulder, hand, R.upperArm, R.forearm, 1);
+    /* the arm wrappers replace the arms' own animation by the IK pose */
+    const upperArm = aboutPoint(new DOMMatrix(), R.shoulder, angleTo(R.shoulder, elbow) - angleTo(R.shoulder, restElbow))
+      .translate(...R.upperArmBase).multiply(animated('ober-arm').inverse());
+    const forearm = aboutPoint(new DOMMatrix().translate(hand.x - R.wrist.x, hand.y - R.wrist.y),
+      R.wrist, angleTo(hand, elbow) - angleTo(R.wrist, restElbow))
+      .translate(...R.forearmBase).multiply(forearmAnim.inverse());
+
+    figure.setAttribute('transform', `rotate(${p.tilt} ${R.rearContact.x} ${R.rearContact.y})`);
+    /* wheels: drop the bob and the squash (SMIL, sim. of the side-to-side lean
+       of the standing stroke) — scaled back to full height about the tyre top */
+    const squash = R.wheelSize / rearWheel.height.animVal.value;
+    const top = R.wheelsY + bobWheels + R.wheelTop;
+    wrap['r__der'].setAttribute('transform',
+      `translate(0 ${-w * bobWheels}) translate(0 ${top}) scale(1 ${lerp(1, squash, w)}) translate(0 ${-top})`);
+    wrap['upper-body'].setAttribute('transform', hopMatrix(torso));
+    wrap['HIP'].setAttribute('transform', hopMatrix(M.inverse()));  /* hip stays with the thighs */
+    WHEELIE_THIGHS.forEach(id => {
+      const bob = animated(id).transformPoint({ x: R.legPivot, y: R.legPivot }).y - R.legPivot;
+      wrap[id].setAttribute('transform', `translate(0 ${-w * bob})`);
+    });
+    wrap['ober-arm'].setAttribute('transform', hopMatrix(upperArm));
+    wrap['unter-arm'].setAttribute('transform', hopMatrix(forearm));
+    const k = p.tilt / W.angle;  /* 0 on the road, 1 in the wheelie */
+    wrap['kopf-container'].setAttribute('transform',
+      `translate(${R.axis.x * W.headOut * k} ${R.axis.y * W.headOut * k}) rotate(${k * W.headDeg} ${R.head.x} ${R.head.y})`);
     requestAnimationFrame(frame);
   };
   requestAnimationFrame(frame);
