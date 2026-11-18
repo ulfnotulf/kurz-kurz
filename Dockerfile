@@ -10,6 +10,7 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --chown=nginx:nginx index.html styles.css app.js /usr/share/nginx/html/
 COPY --chown=nginx:nginx assets/ /usr/share/nginx/html/assets/
 COPY --chown=nginx:nginx fonts/ /usr/share/nginx/html/fonts/
+COPY --chown=nginx:nginx widget/ /usr/share/nginx/html/widget/
 
 ENV PORT=3000
 EXPOSE 3000
